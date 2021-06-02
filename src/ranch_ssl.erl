@@ -129,12 +129,15 @@ do_listen(SocketOpts0, Logger) ->
 	SocketOpts1 = ranch:set_option_default(SocketOpts0, backlog, 1024),
 	SocketOpts2 = ranch:set_option_default(SocketOpts1, nodelay, true),
 	SocketOpts3 = ranch:set_option_default(SocketOpts2, send_timeout, 30000),
-	SocketOpts4 = ranch:set_option_default(SocketOpts3, send_timeout_close, true),
-	SocketOpts = strip_unsupported_options(SocketOpts4),
+	SocketOpts = ranch:set_option_default(SocketOpts3, send_timeout_close, true),
+
+	DisallowedOpts0 = disallowed_listen_options(),
+	DisallowedOpts1 = unsupported_tls_options(SocketOpts) ++ DisallowedOpts0,
+
 	%% We set the port to 0 because it is given in the Opts directly.
 	%% The port in the options takes precedence over the one in the
 	%% first argument.
-	ssl:listen(0, ranch:filter_options(SocketOpts, disallowed_listen_options(),
+	ssl:listen(0, ranch:filter_options(SocketOpts, DisallowedOpts1,
 		[binary, {active, false}, {packet, raw}, {reuseaddr, true}], Logger)).
 
 %% 'binary' and 'list' are disallowed but they are handled
@@ -144,6 +147,15 @@ disallowed_listen_options() ->
 	[alpn_advertised_protocols, client_preferred_next_protocols,
 		fallback, server_name_indication, srp_identity
 		|ranch_tcp:disallowed_listen_options()].
+
+unsupported_tls_options(SocketOpts) ->
+	unsupported_tls_version_options(get_tls_versions(SocketOpts)).
+
+unsupported_tls_version_options(['tlsv1.3']) ->
+	[alpn_preferred_protocols, next_protocols_advertised, reuse_sessions,
+		secure_renegotiate];
+unsupported_tls_version_options(_) ->
+	[].
 
 -spec accept(ssl:sslsocket(), timeout())
 	-> {ok, ssl:sslsocket()} | {error, closed | timeout | atom()}.
@@ -298,24 +310,22 @@ cleanup(#{socket_opts:=SocketOpts}) ->
 cleanup(_) ->
 	ok.
 
--spec strip_unsupported_options(opts()) -> opts().
-strip_unsupported_options(SocketOpts) ->
-    Versions1 = lists:keyfind(versions, 1, SocketOpts),
-    Versions2 = lists:keyfind(protocol_versions, 1, SocketOpts),
-    if
-        (Versions1 == {versions, ['tlsv1.3']}) or (Versions2 == {protocol_versions, ['tlsv1.3']}) ->
-            NewSocketOpts = lists:filter(fun({X, _}) ->
-                    (X /= secure_renegotiate) and (X /= reuse_sessions) and (X /= next_protocols_advertised) and (X /= alpn_preferred_protocols);
-                (_) ->
-                    true
-                end, SocketOpts),
-            if
-                NewSocketOpts /= SocketOpts ->
-                    error_logger:warning_msg("~p~n dropping options unsupported by TLS1.3-only ssl sockets: " ++
-                    "secure_renegotiate, reuse_sessions, next_protocols_advertised and/or alpn_preferred_protocols from ~p~n", [?MODULE, SocketOpts])
-            end,
-            NewSocketOpts;
-        true ->
-            SocketOpts
-    end.
+get_tls_versions(SocketOpts) ->
+	case lists:keyfind(versions, 1, SocketOpts) of
+		{versions, Versions} ->
+			Versions;
+		false ->
+			get_tls_versions_env()
+	end.
 
+get_tls_versions_env() ->
+	case application:get_env(ssl, protocol_version) of
+		{ok, Versions} ->
+			Versions;
+		undefined ->
+			get_tls_versions_ssl()
+	end.
+
+get_tls_versions_ssl() ->
+	{supported, Versions} = lists:keyfind(supported, 1, ssl:versions()),
+	Versions.
